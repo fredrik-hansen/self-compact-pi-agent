@@ -204,15 +204,23 @@ test('P2: native engine preserves split turns, previous summaries, budgets and f
   assert.ok(result.compaction);
   assert.equal(h.requests.length, 2);
   assert.deepEqual(h.requests.map(({ options }) => options.maxTokens), [800, 500]);
+  // pi-ai's normalizeContext injects the system prompt as a system-role message, so the summary
+  // user message is located by role, not index.
+  const userText = request => {
+    const users = request.messages.filter(message => message.role === 'user');
+    assert.equal(users.length, 1);
+    const content = users[0].content;
+    return Array.isArray(content) ? content.map(block => block.text ?? '').join('\n') : content;
+  };
   for (const { request, options } of h.requests) {
     assert.equal(request.systemPrompt, 'EXACT SYSTEM OVERRIDE');
     assert.equal(options.reasoningEffort, 'low');
-    assert.match(request.messages[0].content[0].text, /USER INSTRUCTIONS.*preserve evidence/);
-    assert.match(request.messages[0].content[0].text, /Keep the failing test name/);
-    assert.doesNotMatch(request.messages[0].content[0].text, /Use this EXACT format/);
+    assert.doesNotMatch(userText(request), /Use this EXACT format/);
   }
-  assert.match(h.requests[0].request.messages[0].content[0].text, /<previous-summary>\nPrevious checkpoint/);
-  assert.match(h.requests[1].request.messages[0].content[0].text, /Continue parser tests/);
+  assert.match(userText(h.requests[0].request), /USER INSTRUCTIONS.*preserve evidence/);
+  assert.match(userText(h.requests[0].request), /Keep the failing test name/);
+  assert.match(userText(h.requests[0].request), /<previous-summary>\nPrevious checkpoint/);
+  assert.match(userText(h.requests[1].request), /Continue parser tests/);
   assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
   assert.deepEqual(result.compaction.details.readFiles, ['README.md']);
   assert.deepEqual(result.compaction.details.modifiedFiles, ['parser.ts']);

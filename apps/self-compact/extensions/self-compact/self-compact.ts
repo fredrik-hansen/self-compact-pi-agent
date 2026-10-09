@@ -118,7 +118,7 @@ interface Runtime {
 function nowPrompt(saved?: string): string {
 	const base = `Compact now: write your note_to_self (max ${NOTE_MAX_CHARS} chars: goal, DONE with exact paths and commands, IN PROGRESS, key decisions, verified test results, exact NEXT ACTION last) and call ${TOOL_NAME} as your only tool call.`;
 	if (!saved) return base;
-	return `${base}\n\nA note is already saved from a previous attempt. Pass it to ${TOOL_NAME} verbatim instead of inventing a new one. Saved note, verbatim:\n\n${saved}\n\n---\nCall ${TOOL_NAME} now with exactly that note.`;
+	return `${base}\n\nA note is already saved from a previous attempt. Call ${TOOL_NAME} again (any note_to_self text) to retry with the saved note, or pass replace: true with a new note_to_self to overwrite it. Saved note:\n\n${saved}\n\n---\nCall ${TOOL_NAME} now.`;
 }
 
 function guidanceMessage(text: string) {
@@ -548,7 +548,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: "Self Compact",
-		description: `Hand off to yourself across a context compaction. Provide note_to_self (1 to ${NOTE_MAX_CHARS} characters): the goal, DONE work with exact file paths and commands, IN PROGRESS state, key decisions, verified test results, and the exact NEXT ACTION as the last line. Call it alone in a tool batch. The note is saved, this run ends, the context is compacted once you are idle, and the note is returned verbatim so you continue from NEXT ACTION. At the hard cutoff every other tool is blocked until this succeeds.`,
+		description: `Hand off to yourself across a context compaction. Provide note_to_self (1 to ${NOTE_MAX_CHARS} characters): the goal, DONE work with exact file paths and commands, IN PROGRESS state, key decisions, verified test results, and the exact NEXT ACTION as the last line. Call it alone in a tool batch. The note is saved, this run ends, the context is compacted once you are idle, and the note is returned verbatim so you continue from NEXT ACTION. At the hard cutoff every other tool is blocked until this succeeds. If a note is already saved (e.g. after a failed compaction), calling again retries with the saved note even when note_to_self differs; pass replace: true to overwrite the saved note.`,
 		promptSnippet: "Compact your own context: save a note_to_self, compaction runs when the turn ends, the note comes back verbatim",
 		promptGuidelines: [
 			`Use ${TOOL_NAME} alone in a tool batch when a [self-compact · …] message asks you to compact, or at a clean checkpoint when context is high.`,
@@ -557,6 +557,11 @@ export default function selfCompact(pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			note_to_self: Type.String({ description: `Your handoff note (1-${NOTE_MAX_CHARS} chars). Ends with the exact NEXT ACTION.` }),
+			replace: Type.Optional(
+				Type.Boolean({
+					description: `Overwrite the saved note with note_to_self when one is already saved. Default false: a call whose note differs from the saved one retries with the saved note instead, so a failed compaction can be retried without reproducing the note byte for byte.`,
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Self-compaction cancelled before saving the note.");
@@ -573,21 +578,29 @@ export default function selfCompact(pi: ExtensionAPI) {
 				const keep = keepRecentTokens(ctx.cwd);
 				throw new Error(`Nothing to compact yet: Pi keeps the newest ${keep.toLocaleString("en-US")} tokens of messages untouched and this session does not reach past them (context ${R.usage.tokens?.toLocaleString("en-US") ?? "?"} tokens, ${formatPct(R.usage.percent, 1)}). No note was saved and no tool is blocked. Keep working and call ${TOOL_NAME} later.`);
 			}
-			if (existing && existing.note.trim() !== raw.trim()) {
-				throw new Error(`A note is already saved (${existing.note.length} chars). Retry ${TOOL_NAME} with that saved note verbatim instead of a new one.`);
+			// Byte-exact reproduction of a long saved note is unreliable, so a mismatching call
+			// reuses the saved note (the wedge escape) unless replace: true overwrites it.
+			let reusedSavedNote = false;
+			if (existing && existing.note.trim() !== raw.trim() && params.replace !== true) {
+				R.state.handoff = { ...existing, status: "pending", attempts: 0, error: undefined };
+				reusedSavedNote = true;
+			} else {
+				// A verbatim retry keeps the original bytes; replace or a new cycle gets a fresh durable id.
+				const fresh = !existing || (existing.note.trim() !== raw.trim() && params.replace === true);
+				const note = fresh ? raw : existing.note;
+				R.state.handoff = { id: fresh ? randomUUID() : existing.id, note, status: "pending", attempts: 0, savedAt: Date.now() };
 			}
-			// A retry keeps the original bytes; a new cycle gets a fresh durable id.
-			const note = existing ? existing.note : raw;
-			R.state.handoff = { id: existing?.id ?? randomUUID(), note, status: "pending", attempts: 0, savedAt: Date.now() };
+			const handoffNow = R.state.handoff!;
 			R.lastCompactionError = undefined;
 			setLocked(true);
 			save();
 			refreshUi(ctx);
-			notify(ctx, `self-compact: note saved (${note.length} chars). Compaction runs when this turn ends.`, "info");
+			notify(ctx, `self-compact: note saved (${handoffNow.note.length} chars). Compaction runs when this turn ends.`, "info");
 			const at = R.usage.tokens === null ? "unknown usage" : `${R.usage.tokens.toLocaleString("en-US")} tokens (${formatPct(R.usage.percent, 1)}), level ${R.level}`;
+			const reuseNotice = reusedSavedNote ? `Reusing the note saved earlier (${handoffNow.note.length} chars); the differing note_to_self was discarded. Pass replace: true to overwrite the saved note. ` : "";
 			return {
-				content: [{ type: "text", text: `Note saved (${note.length} chars) at ${at}. Every other tool is blocked until compaction succeeds. Stop now: compaction runs when this turn ends and your note will be returned verbatim.` }],
-				details: { handoffId: R.state.handoff.id, noteChars: note.length, cycle: R.state.cycle + 1, note, usedTokens: R.usage.tokens, usedPercent: R.usage.percent, level: R.level },
+				content: [{ type: "text", text: `${reuseNotice}Note saved (${handoffNow.note.length} chars) at ${at}. Every other tool is blocked until compaction succeeds. Stop now: compaction runs when this turn ends and your note will be returned verbatim.` }],
+				details: { handoffId: handoffNow.id, noteChars: handoffNow.note.length, cycle: R.state.cycle + 1, note: handoffNow.note, usedTokens: R.usage.tokens, usedPercent: R.usage.percent, level: R.level },
 				terminate: true,
 			};
 		},
