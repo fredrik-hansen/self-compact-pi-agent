@@ -17,17 +17,20 @@
  *   returned verbatim as a handoff message (shown in full) that starts the next turn. When Pi would find nothing to
  *   compact (the session fits inside keepRecentTokens) the tool refuses instead of saving a note and locking.
  * - Failure or cancellation keeps the note and the lock; retries, /self-compact-now, reload and /tree recovery.
- * - One-line replacement footer: model id on the left, the 20-cell context bar and phase on the right.
+ * - Context bar integrates into the existing footer line: this extension publishes plain bar data
+ *   (cells/label/tag) to a JSON state file (~/.pi/agent/extensions/.state/self-compact.json) and
+ *   custom-footer.ts, which owns setFooter here, renders it right-aligned. No setFooter, no extra line.
  *
  * Merged from the claude-fable-5-1 and gpt-6-astra implementations (see specs/self-compact-merge.html).
  */
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { generateSummary, hasCompactionMaterial, keepRecentTokens } from "./summary.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { formatPct, formatTokens, renderContextBar } from "./context-bar.ts";
 import {
@@ -68,6 +71,9 @@ export const TOOL_NAME = "self_compact";
 export const VIEW_TOOL_NAME = "view_context";
 export { HANDOFF_TYPE, STATE_TYPE };
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+/** Shared state for footer integrations: custom-footer.ts renders this as a segment on its line.
+ * The env override keeps tests from writing into the deployed extensions tree. */
+const barStateFile = (): string => process.env.SELF_COMPACT_BAR_STATE_FILE ?? join(EXTENSION_DIR, "..", ".state", "self-compact.json");
 const MAX_AUTO_RETRIES = 3;
 const SUMMARY_ATTEMPTS = 2;
 const GUIDANCE_TYPE = "self-compact-guidance";
@@ -303,8 +309,42 @@ export default function selfCompact(pi: ExtensionAPI) {
 	function refreshUi(ctx: ExtensionContext) {
 		R.usage = snapshotUsage(ctx);
 		R.level = R.thresholds ? levelFor(R.usage.tokens, R.thresholds) : "unknown";
-		if (ctx.mode === "tui") R.requestRender?.();
-		else if (ctx.hasUI) ctx.ui.setStatus("self-compact", [contextBarText(), statusTag()].filter(Boolean).join(" "));
+		if (ctx.mode === "tui") {
+			writeBarState();
+			R.requestRender?.();
+		} else if (ctx.hasUI) ctx.ui.setStatus("self-compact", [contextBarText(), statusTag()].filter(Boolean).join(" "));
+	}
+
+	/** Publish the bar segment for custom-footer.ts (the setFooter owner). Plain data, no ANSI. */
+	function writeBarState() {
+		try {
+			const t = R.thresholds;
+			if (!t) return;
+			const u = R.usage;
+			const bar = renderContextBar({
+				usedPct: u.percent,
+				cachedPct: u.window > 0 ? (u.cachedTokens / u.window) * 100 : 0,
+				softPct: t.softPct,
+				warnPct: t.warnPct,
+				forcedPct: t.forcedPct,
+			});
+			const tag = statusTag();
+			const data = {
+				version: 1,
+				writtenAt: Date.now(),
+				cells: bar.bar,
+				label: bar.label,
+				tag,
+				tagColor: inert() || locked() ? "error" : levelColor(R.level),
+				cycle: R.state.cycle,
+				level: R.level,
+			};
+			const path = barStateFile();
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, JSON.stringify(data));
+		} catch {
+			// State file is best-effort display glue; never break the extension over it.
+		}
 	}
 
 	/**
@@ -629,46 +669,11 @@ export default function selfCompact(pi: ExtensionAPI) {
 		return new Text([theme.fg("accent", theme.bold(title ?? "self-compact info")), ...rest.map((l) => theme.fg("text", l))].join("\n"), 0, 0);
 	});
 
-	function installFooter(ctx: ExtensionContext) {
-		if (ctx.mode !== "tui") return;
-		ctx.ui.setFooter((tui, theme) => {
-			R.requestRender = () => tui.requestRender();
-			return {
-				dispose: () => {
-					R.requestRender = undefined;
-				},
-				invalidate() {},
-				render(width: number): string[] {
-					const t = R.thresholds;
-					const u = R.usage;
-					const level = R.level;
-					const bar = renderContextBar({
-						usedPct: t ? u.percent : null,
-						cachedPct: u.window > 0 ? (u.cachedTokens / u.window) * 100 : 0,
-						softPct: t?.softPct ?? 0,
-						warnPct: t?.warnPct ?? 0,
-						forcedPct: t?.forcedPct ?? 0,
-					});
-					const cells = bar.cells
-						.map((c) => {
-							if (c === "#") return theme.fg("success", c);
-							if (c === "=") return theme.fg("accent", c);
-							if (c === "~") return theme.fg("muted", c);
-							if (c === "!") return theme.fg("warning", c);
-							if (c === "|") return theme.fg("error", c);
-							return theme.fg("dim", c);
-						})
-						.join("");
-					const problem = inert();
-					const tag = statusTag();
-					const left = theme.fg("dim", ` ${ctx.model?.id ?? "no-model"}`) + (R.state.cycle > 0 ? theme.fg("dim", ` · cycle ${R.state.cycle}`) : "");
-					const phase = tag ? ` ${theme.fg(problem ? "error" : locked() ? "error" : levelColor(level), tag)}` : "";
-					const right = `${theme.fg("dim", "[")}${cells}${theme.fg("dim", `] ${bar.label}`)}${phase} `;
-					const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-					return [truncateToWidth(left + pad + right, width)];
-				},
-			};
-		});
+	function installFooter(_ctx: ExtensionContext) {
+		// Additive integration: no setFooter (that would evict custom-footer.ts) and no
+		// extra widget line. The bar is written to the shared state file (see barStateFile)
+		// and rendered on the existing footer line by custom-footer.ts, which owns
+		// ctx.ui.setFooter here.
 	}
 
 	// ---------------------------------------------------------------- events
